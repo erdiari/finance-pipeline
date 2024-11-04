@@ -12,7 +12,7 @@ from typing import Dict, List
 import signal
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("data_ingest:binance")
 
 class DatabaseManager:
     def __init__(self, symbols):
