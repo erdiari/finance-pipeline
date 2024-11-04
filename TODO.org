@@ -1,0 +1,13 @@
+#+title: Finance analyzer
+
+- [0/3] Data ingestion pipeline
+  A. [-] Financial Data
+     Genel olarak redis'e yazıyor ve periyodik olarak postgresql'e taşıyot
+     1. [X] Binance
+     2. [ ] Yahoo Finance
+  B. [ ] Finance News -> Save to mongodb
+  C. [ ] Containerize and expose parameters
+- [ ] Processing service
+- [ ] Analysis service
+- [ ] Report generation service
+- [ ] API gateway
