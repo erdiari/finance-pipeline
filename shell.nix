@@ -4,6 +4,8 @@ pkgs.mkShell {
   buildInputs = with pkgs; [
     (python311.withPackages (ps: with ps; [
       aiohttp
+      motor
+      feedparser
       websockets
       websocket-client
       requests
