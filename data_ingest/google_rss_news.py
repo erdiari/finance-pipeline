@@ -1,4 +1,4 @@
-#/usr/bin/env python3
+#!/usr/bin/env python3
 
 import asyncio
 import aiohttp
@@ -6,17 +6,24 @@ import feedparser
 import logging
 from datetime import datetime, timezone, timedelta
 import motor.motor_asyncio
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 import signal
 from dataclasses import dataclass
 import random
 import hashlib
 from urllib.parse import quote, urlparse
 from time import mktime
-from pymongo import UpdateOne
+from pymongo import UpdateOne, ASCENDING, DESCENDING, TEXT
+import re
+from bs4 import BeautifulSoup
+from googlenewsdecoder import new_decoderv1
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger('data_ingest:bloomberg')
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('data_ingest:google_rss_news')
 
 @dataclass
 class BackoffConfig:
@@ -27,12 +34,13 @@ class BackoffConfig:
     max_attempts: int = 5
 
     def calculate_delay(self, attempts: int) -> float:
+        """Calculate delay with exponential backoff and jitter"""
         delay = min(self.max_delay, self.initial_delay * (self.factor ** attempts))
         jitter_amount = delay * self.jitter * random.uniform(-1, 1)
         return max(0, delay + jitter_amount)
 
 class NewsFeeds:
-    """Financial news feed URLs"""
+    """Financial news feed URLs manager"""
 
     @staticmethod
     def get_company_feed(company: str) -> str:
@@ -90,40 +98,100 @@ class NewsFeeds:
         return feeds
 
 class NewsArticle:
+    """Process and structure Google News RSS entries"""
+
     def __init__(self, entry: Dict, category: str):
         self.entry = entry
         self.category = category
 
-    def to_dict(self) -> Dict:
+    def _extract_source(self) -> str:
+        """Extract source from Google News entry"""
+        try:
+            if hasattr(self.entry, 'source'):
+                return self.entry.source.get('title', 'unknown')
+
+            # Fallback to source from link
+            domain = urlparse(self.entry.get('link', '')).netloc
+            return domain.replace('www.', '')
+        except Exception as e:
+            logger.warning(f"Error extracting source: {e}")
+            return 'unknown'
+
+    async def _extract_content(self, url:str) -> str:
+        # """Scrapes article content by following redirects and extracting text. Also sets URL"""
+        # headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.54 Safari/537.36'}
+
+        async with aiohttp.ClientSession() as session:
+            try:
+                decoded_url = new_decoderv1(url)["decoded_url"]
+                async with session.get(decoded_url) as response: # , headers=headers
+                    if response.status != 200:
+                        logger.warning(f'HTTP {response.status}: Failed to fetch content')
+                    html_content = await response.text()
+                    # Parse the HTML content
+                    content = BeautifulSoup(html_content, 'html.parser').get_text()
+                    return decoded_url, content
+
+            except aiohttp.ClientError as e:
+                logger.error(f"Network error while fetching {url}: {str(e)}")
+            except Exception as e:
+                logger.error(f"Error processing {url}: {str(e)}")
+
+    def _extract_symbols(self, text: str) -> Set[str]:
+        """Extract stock symbols from text"""
+        symbols = set()
+        for symbol in NewsFeeds.COMPANIES.keys():
+            if re.search(rf'\b{symbol}\b', text):
+                symbols.add(symbol)
+
+        # Add company name matches
+        for symbol, company in NewsFeeds.COMPANIES.items():
+            if re.search(rf'\b{company}\b', text, re.IGNORECASE):
+                symbols.add(symbol)
+        return symbols
+
+    def _get_published_date(self) -> datetime:
+        """Extract and validate published date"""
+        try:
+            if hasattr(self.entry, 'published_parsed') and self.entry.published_parsed:
+                return datetime.fromtimestamp(mktime(self.entry.published_parsed), tz=timezone.utc)
+        except Exception as e:
+            logger.warning(f"Error parsing published date: {e}")
+        return datetime.now(timezone.utc)
+
+    def _clean_title(self, title: str) -> str:
+        """Clean the title, removing source if present"""
+        if ' - ' in title:
+            return title.split(' - ')[0].strip()
+        return title.strip()
+
+    async def to_dict(self) -> Dict:
         """Convert feed entry to standardized article format"""
         try:
-            # Get published date
-            if hasattr(self.entry, 'published_parsed') and self.entry.published_parsed:
-                published_at = datetime.fromtimestamp(mktime(self.entry.published_parsed), tz=timezone.utc)
-            else:
-                published_at = datetime.now(timezone.utc)
+            # Get URL and generate ID
 
-            # Generate unique ID
-            article_id = hashlib.md5(
-                self.entry.get('link', '').encode('utf-8')
-            ).hexdigest()
+            # Clean title and summary
+            title = self._clean_title(self.entry.get('title', ''))
+            # summary = self._clean_html_summary(self.entry.get('summary', ''))
 
-            # Extract source
-            source = self._extract_source(self.entry.get('link', ''))
-
-            # Extract stock symbols mentioned in title and summary
-            symbols = self._extract_symbols(
-                f"{self.entry.get('title', '')} {self.entry.get('summary', '')}"
-            )
+            # Extract symbols from title
+            # TODO: consider adding content to extract symbols
+            symbols = self._extract_symbols(title)
+            content = await self._extract_content(self.entry.get('link', ''))
+            if not content:
+                return
+            url, content = content
+            article_id = hashlib.md5(url.encode('utf-8')).hexdigest()
 
             return {
                 'article_id': article_id,
-                'title': self.entry.get('title', ''),
-                'url': self.entry.get('link', ''),
-                'summary': self.entry.get('summary', ''),
-                'published_at': published_at,
+                'title': title,
+                'content': content,
+                'url': url,
+                'content': content,
+                'published_at': self._get_published_date(),
                 'category': self.category,
-                'source': source,
+                'source': self._extract_source(),
                 'symbols': list(symbols),
                 'fetch_time': datetime.now(timezone.utc)
             }
@@ -131,24 +199,9 @@ class NewsArticle:
             logger.error(f"Error converting article to dict: {e}")
             raise
 
-    def _extract_source(self, url: str) -> str:
-        """Extract source from article URL"""
-        try:
-            domain = urlparse(url).netloc
-            return domain.replace('www.', '')
-        except:
-            return 'unknown'
-
-    def _extract_symbols(self, text: str) -> set:
-        """Extract stock symbols from text"""
-        symbols = set()
-        # Add mentioned company symbols
-        for symbol in NewsFeeds.COMPANIES.keys():
-            if symbol in text or NewsFeeds.COMPANIES[symbol] in text:
-                symbols.add(symbol)
-        return symbols
-
 class NewsScraper:
+    """Google News RSS feed scraper with MongoDB storage"""
+
     def __init__(self):
         # MongoDB configuration
         self.mongo_config = {
@@ -160,7 +213,7 @@ class NewsScraper:
             'auth_source': 'admin'
         }
 
-        # Initialize feeds and session
+        # Initialize components
         self.feeds = NewsFeeds.get_all_feeds()
         self.session: Optional[aiohttp.ClientSession] = None
         self.backoff = BackoffConfig()
@@ -175,12 +228,20 @@ class NewsScraper:
         )
 
         # Initialize MongoDB client
-        self.client = motor.motor_asyncio.AsyncIOMotorClient(self.mongo_uri)
+        self.client = motor.motor_asyncio.AsyncIOMotorClient(
+            self.mongo_uri,
+            serverSelectionTimeoutMS=5000
+        )
         self.db = self.client[self.mongo_config['database']]
 
-        # Configuration
+        # Operating parameters
         self.poll_interval = 300  # 5 minutes
         self.batch_size = 3
+        self.cleanup_interval = 86400  # 24 hours
+        self.retention_days = 30
+        self.maintain = False
+
+        # Request headers
         self.user_agents = [
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
@@ -191,47 +252,48 @@ class NewsScraper:
         """Ensure aiohttp session exists"""
         if self.session is None or self.session.closed:
             self.session = aiohttp.ClientSession(
-                headers={'User-Agent': random.choice(self.user_agents)}
+                headers={'User-Agent': random.choice(self.user_agents)},
+                timeout=aiohttp.ClientTimeout(total=30)
             )
 
     async def init_database(self):
         """Initialize MongoDB collections and indexes"""
         try:
-            # Create main articles collection and indexes
-            await self.db.articles.create_index([("article_id", 1)], unique=True)
-            await self.db.articles.create_index([("published_at", -1)])
-            await self.db.articles.create_index([("category", 1)])
-            await self.db.articles.create_index([("source", 1)])
-            await self.db.articles.create_index([("symbols", 1)])
-
-            # Create text index for search
+            # Create indexes
+            await self.db.articles.create_index([("article_id", ASCENDING)], unique=True)
+            await self.db.articles.create_index([("published_at", DESCENDING)])
+            await self.db.articles.create_index([("category", ASCENDING)])
+            await self.db.articles.create_index([("source", ASCENDING)])
+            await self.db.articles.create_index([("symbols", ASCENDING)])
             await self.db.articles.create_index([
-                ("title", "text"),
-                ("summary", "text")
+                ("title", TEXT),
+                ("content", TEXT)
             ])
 
             logger.info("Database initialized successfully")
-
         except Exception as e:
             logger.error(f"Failed to initialize database: {e}")
             raise
 
     async def fetch_feed(self, category: str, url: str) -> Optional[List[Dict]]:
-        """Fetch and parse RSS feed"""
+        """Fetch and parse RSS feed with retries"""
         await self.ensure_session()
         attempts = 0
 
         while attempts < self.backoff.max_attempts:
             try:
-                async with self.session.get(url, timeout=30) as response:
+                async with self.session.get(url) as response:
                     if response.status == 200:
                         content = await response.text()
                         feed = feedparser.parse(content)
 
+                        if hasattr(feed, 'bozo_exception'):
+                            logger.warning(f"Feed parsing warning for {category}: {feed.bozo_exception}")
+
                         articles = []
                         for entry in feed.entries:
                             try:
-                                article = NewsArticle(entry, category).to_dict()
+                                article = await NewsArticle(entry, category).to_dict()
                                 articles.append(article)
                             except Exception as e:
                                 logger.error(f"Error processing feed entry: {e}")
@@ -243,7 +305,6 @@ class NewsScraper:
                         delay = self.backoff.calculate_delay(attempts)
                         logger.warning(f"Rate limited for {category}. Waiting {delay:.2f}s")
                         await asyncio.sleep(delay)
-
                     else:
                         delay = self.backoff.calculate_delay(attempts)
                         logger.error(f"HTTP {response.status} for {category}. Waiting {delay:.2f}s")
@@ -259,12 +320,11 @@ class NewsScraper:
         return None
 
     async def save_articles(self, articles: List[Dict]):
-        """Save articles to MongoDB"""
+        """Save articles to MongoDB using bulk operations"""
         if not articles:
             return
 
         try:
-            # Use unordered bulk write to continue on duplicate key errors
             ops = [
                 UpdateOne(
                     {'article_id': article['article_id']},
@@ -292,10 +352,9 @@ class NewsScraper:
             logger.error(f"Error processing feed {category}: {e}")
 
     async def collect_news(self):
-        """Collect news from all feeds"""
+        """Collect news from all feeds with batching"""
         while self.running:
             try:
-                # Process feeds in batches
                 feeds = list(self.feeds.items())
                 for i in range(0, len(feeds), self.batch_size):
                     batch = feeds[i:i + self.batch_size]
@@ -305,7 +364,6 @@ class NewsScraper:
                     ]
                     await asyncio.gather(*tasks)
 
-                    # Add delay between batches
                     if i + self.batch_size < len(feeds):
                         await asyncio.sleep(2)
 
@@ -315,9 +373,9 @@ class NewsScraper:
             await asyncio.sleep(self.poll_interval)
 
     async def cleanup_old_articles(self):
-        """Remove articles older than 30 days"""
+        """Remove articles older than retention period"""
         try:
-            cutoff_date = datetime.now(timezone.utc) - timedelta(days=30)
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=self.retention_days)
             result = await self.db.articles.delete_many({
                 'published_at': {'$lt': cutoff_date}
             })
@@ -327,39 +385,158 @@ class NewsScraper:
 
     async def maintenance_task(self):
         """Run periodic maintenance tasks"""
-        while self.running:
+        while self.running and self.maintain:
             await self.cleanup_old_articles()
-            await asyncio.sleep(86400)  # Run daily
+            await asyncio.sleep(self.cleanup_interval)
 
     async def close(self):
         """Cleanup resources"""
-        if self.session and not self.session.closed:
-            await self.session.close()
-        if self.client:
-            self.client.close()
+        try:
+            if self.session and not self.session.closed:
+                await self.session.close()
+            if self.client:
+                self.client.close()
+            logger.info("Resources cleaned up successfully")
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
 
     async def run(self):
-        """Run the news scraper"""
+        """Run the news scraper with proper task management"""
         try:
+            # Initialize database first
             await self.init_database()
-            await asyncio.gather(
+
+            # Create tasks
+            news_task = asyncio.create_task(
                 self.collect_news(),
-                self.maintenance_task()
+                name="news_collection"
             )
+            maintenance_task = asyncio.create_task(
+                self.maintenance_task(),
+                name="maintenance"
+            )
+
+            # Run tasks concurrently
+            running_tasks = [news_task, maintenance_task]
+
+            # Wait for tasks to complete or be cancelled
+            done, pending = await asyncio.wait(
+                running_tasks,
+                return_when=asyncio.FIRST_EXCEPTION
+            )
+
+            # Check for exceptions
+            for task in done:
+                if task.exception():
+                    logger.error(f"Task failed with error: {task.exception()}")
+                    raise task.exception()
+
+        except Exception as e:
+            logger.error(f"Error in main run loop: {e}")
+            raise
         finally:
+            # Ensure cleanup happens
             await self.close()
 
+            # Cancel any pending tasks
+            for task in asyncio.all_tasks():
+                if task is not asyncio.current_task():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+async def startup_sequence():
+    """Startup sequence with health checks"""
+    try:
+        scraper = NewsScraper()
+
+        # Test database connection
+        await scraper.init_database()
+
+        # Test feed fetching
+        test_feed = next(iter(scraper.feeds.items()))
+        articles = await scraper.fetch_feed(test_feed[0], test_feed[1])
+        if not articles:
+            raise Exception("Failed to fetch test feed")
+
+        logger.info("Startup checks completed successfully")
+        return scraper
+    except Exception as e:
+        logger.error(f"Startup sequence failed: {e}")
+        raise
+
+async def shutdown(loop, signal=None):
+    """Cleanup function for graceful shutdown"""
+    try:
+        if signal:
+            logger.info(f"Received exit signal {signal.name}")
+
+        logger.info("Initiating shutdown sequence...")
+
+        # Stop accepting new tasks
+        loop.stop()
+
+        # Stop the scraper's main loop
+        if scraper:
+            scraper.running = False
+            await scraper.close()
+
+        # Cancel all running tasks
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        if tasks:
+            logger.info(f"Cancelling {len(tasks)} outstanding tasks")
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        logger.info("Shutdown completed successfully")
+
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}")
+        raise
+    finally:
+        # Ensure the loop is stopped even if an error occurred
+        if not loop.is_closed():
+            loop.stop()
+
 def main():
-    scraper = NewsScraper()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    scraper = None
 
-    def shutdown(signum, frame):
-        logger.info("Shutting down...")
-        scraper.running = False
 
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+    def handle_exception(loop, context):
+        """Global exception handler"""
+        msg = context.get("exception", context["message"])
+        logger.error(f"Caught global exception: {msg}")
+        asyncio.create_task(shutdown(loop))
 
-    asyncio.run(scraper.run())
+    try:
+        # Set up signal handlers
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(
+                sig,
+                lambda s=sig: asyncio.create_task(shutdown(loop, sig))
+            )
+
+        # Set up global exception handler
+        loop.set_exception_handler(handle_exception)
+
+        # Start the scraper
+        scraper = loop.run_until_complete(startup_sequence())
+        loop.run_until_complete(scraper.run())
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        raise
+    finally:
+        try:
+            loop.run_until_complete(shutdown(loop))
+            loop.close()
+            logger.info("Shutdown complete")
+        except Exception as e:
+            logger.error(f"Error during final cleanup: {e}")
 
 if __name__ == "__main__":
     main()
