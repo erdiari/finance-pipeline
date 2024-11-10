@@ -1,0 +1,54 @@
+# Use Python 3.11 slim image as base
+FROM python:3.11-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    python3-dev \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first to leverage Docker cache
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the application code
+COPY yahoo_finance.py .
+
+# Environment variables with defaults
+ENV REDIS_HOST=localhost \
+    REDIS_PORT=6379 \
+    POSTGRES_HOST=localhost \
+    POSTGRES_PORT=5432 \
+    POSTGRES_DB=timeseries_db \
+    POSTGRES_USER=postgres \
+    POSTGRES_PASSWORD=postgres \
+    POLL_INTERVAL=60 \
+    ARCHIVE_INTERVAL=300 \
+    LOG_LEVEL=INFO \
+    SYMBOLS=AAPL,MSFT,GOOGL,AMZN,META,NVDA,TSLA,JPM,V,NFLX \
+    BACKOFF_INITIAL_DELAY=1.0 \
+    BACKOFF_MAX_DELAY=60.0 \
+    BACKOFF_FACTOR=2.0 \
+    BACKOFF_JITTER=0.1 \
+    BACKOFF_MAX_ATTEMPTS=5
+
+# Create non-root user
+RUN useradd -m -u 1000 appuser
+USER appuser
+
+# Set resource limits
+LABEL com.docker.container.cpu_quota="100000"  # 10% of CPU
+LABEL com.docker.container.memory="256M"       # 256MB memory limit
+
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python3 -c "import redis; redis.Redis(host='$REDIS_HOST', port=$REDIS_PORT).ping()"
+
+# Command to run the application
+CMD ["python3", "yahoo_finance.py"]

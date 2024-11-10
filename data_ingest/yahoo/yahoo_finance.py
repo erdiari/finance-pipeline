@@ -13,6 +13,7 @@ import signal
 import aiohttp
 import random
 from dataclasses import dataclass
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("data_ingest:yahoo_finance")
@@ -79,11 +80,11 @@ class MarketHours:
 class DatabaseManager:
     def __init__(self, symbols):
         self.db_config = {
-            'dbname': 'timeseries_db',
-            'user': 'postgres',
-            'password': 'postgres',
-            'host': 'localhost',
-            'port': '5432'
+            'dbname': os.getenv('POSTGRES_DB', 'timeseries_db'),
+            'user': os.getenv('POSTGRES_USER', 'postgres'),
+            'password': os.getenv('POSTGRES_PASSWORD', 'postgres'), 
+            'host': os.getenv('POSTGRES_HOST', 'localhost'),
+            'port': os.getenv('POSTGRES_PORT', '5432')
         }
 
         self.symbols = symbols
@@ -198,14 +199,10 @@ class DatabaseManager:
 
 class YahooFinanceCollector:
     def __init__(self):
-        self.symbols = {
-            'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META',
-            'NVDA', 'TSLA', 'JPM', 'V', 'NFLX'
-        }
 
         self.redis_client = redis.Redis(
-            host='localhost',
-            port=6379,
+            host=os.getenv('REDIS_HOST', 'localhost'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
             decode_responses=True
         )
 
@@ -217,8 +214,9 @@ class YahooFinanceCollector:
         self.running = True
 
         # Configuration
-        self.poll_interval = 60  # 1 minute
-        self.archive_interval = 300  # 5 minutes
+        self.poll_interval = int(os.getenv('POLL_INTERVAL', 60))
+        self.archive_interval = int(os.getenv('ARCHIVE_INTERVAL', 300))
+        self.symbols = set(os.getenv('SYMBOLS', 'AAPL,MSFT,GOOGL').split(','))
 
     async def ensure_session(self):
         """Ensure aiohttp session exists"""

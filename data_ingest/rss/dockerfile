@@ -1,0 +1,54 @@
+# Use Python 3.9 slim image as base
+FROM python:3.9-slim
+
+# Set environment variables
+ENV MONGODB_HOST=localhost \
+    MONGODB_PORT=27017 \
+    MONGODB_USERNAME=mongo \
+    MONGODB_PASSWORD=mongo \
+    MONGODB_DATABASE=news_data \
+    MONGODB_AUTH_SOURCE=admin \
+    POLL_INTERVAL=300 \
+    BATCH_SIZE=3 \
+    CLEANUP_INTERVAL=86400 \
+    RETENTION_DAYS=30 \
+    MAINTAIN=false \
+    PYTHONUNBUFFERED=1
+
+# Create and set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    gcc \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first to leverage Docker cache
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the application code
+COPY google_rss_news.py .
+COPY googlenewsdecoder.py .
+
+# Create non-root user
+RUN useradd -m -r scraper && \
+    chown -R scraper:scraper /app
+
+# Switch to non-root user
+USER scraper
+
+# Set resource limitations and restart policy
+LABEL com.docker.container.cpu_quota="100000"  # 10% of CPU
+LABEL com.docker.container.memory="256M"       # 256MB memory limit
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD ps aux | grep python | grep google_rss_news.py || exit 1
+
+# Run the script
+CMD ["python", "google_rss_news.py"]

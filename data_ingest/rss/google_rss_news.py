@@ -17,12 +17,10 @@ from pymongo import UpdateOne, ASCENDING, DESCENDING, TEXT
 import re
 from bs4 import BeautifulSoup
 from googlenewsdecoder import new_decoderv1
+import os
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('data_ingest:google_rss_news')
 
 @dataclass
@@ -235,11 +233,11 @@ class NewsScraper:
         self.db = self.client[self.mongo_config['database']]
 
         # Operating parameters
-        self.poll_interval = 300  # 5 minutes
-        self.batch_size = 3
-        self.cleanup_interval = 86400  # 24 hours
-        self.retention_days = 30
-        self.maintain = False
+        self.poll_interval = int(os.getenv('POLL_INTERVAL', 300))
+        self.batch_size = int(os.getenv('BATCH_SIZE', 3))
+        self.cleanup_interval = int(os.getenv('CLEANUP_INTERVAL', 86400))
+        self.retention_days = int(os.getenv('RETENTION_DAYS', 30))
+        self.maintain = os.getenv('MAINTAIN', 'false').lower() == 'true'
 
         # Request headers
         self.user_agents = [

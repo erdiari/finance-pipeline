@@ -1,0 +1,39 @@
+# Use official Python runtime as a parent image
+FROM python:3.9-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    libpq-dev \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements file
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY binance.py .
+
+# Set environment variables with defaults
+ENV POSTGRES_DB=timeseries_db \
+    POSTGRES_USER=postgres \
+    POSTGRES_PASSWORD=postgres \
+    POSTGRES_HOST=localhost \
+    POSTGRES_PORT=5432 \
+    REDIS_HOST=localhost \
+    REDIS_PORT=6379 \
+    TRADING_SYMBOLS=BTCUSDT,ETHUSDT,BNBUSDT \
+    ARCHIVE_INTERVAL_SECONDS=60 \
+    BINANCE_WS_URL=wss://stream.binance.com:9443/ws
+
+# Set resource limitations
+LABEL com.docker.container.cpu_quota="100000"  # 10% of CPU
+LABEL com.docker.container.memory="256M"       # 256MB memory limit
+
+# Run the application
+CMD ["python", "binance.py"]

@@ -10,6 +10,7 @@ import psycopg2
 from psycopg2.extras import execute_values
 from typing import Dict, List
 import signal
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("data_ingest:binance")
@@ -17,11 +18,11 @@ logger = logging.getLogger("data_ingest:binance")
 class DatabaseManager:
     def __init__(self, symbols):
         self.db_config = {
-            'dbname': 'timeseries_db',
-            'user': 'postgres',
-            'password': 'postgres',
-            'host': 'localhost',
-            'port': '5432'
+            'dbname': os.getenv('POSTGRES_DB', 'timeseries_db'),
+            'user': os.getenv('POSTGRES_USER', 'postgres'),
+            'password': os.getenv('POSTGRES_PASSWORD', 'postgres'),
+            'host': os.getenv('POSTGRES_HOST', 'localhost'),
+            'port': os.getenv('POSTGRES_PORT', '5432')
         }
         self.symbols = symbols
         self.init_database()
@@ -108,8 +109,8 @@ class DatabaseManager:
 class FinancialDataReader:
     def __init__(self):
         self.redis_client = redis.Redis(
-            host='localhost',
-            port=6379,
+            host=os.getenv('REDIS_HOST', 'localhost'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
             decode_responses=True
         )
 
@@ -117,9 +118,12 @@ class FinancialDataReader:
         self.symbols = {'BTCUSDT', 'ETHUSDT', 'BNBUSDT'}
 
         # Archive configuration
-        self.archive_interval = 60  # Archive every minute
+        self.archive_interval = int(os.getenv('ARCHIVE_INTERVAL_SECONDS', 60))
 
-        self.binance_ws_url = "wss://stream.binance.com:9443/ws"
+        self.binance_ws_url = os.getenv(
+            'BINANCE_WS_URL', 
+            "wss://stream.binance.com:9443/ws"
+        )
 
         self.db_manager = DatabaseManager(self.symbols)
 
