@@ -1,6 +1,10 @@
 # Use Python 3.9 slim image as base
 FROM python:3.9-slim
 
+# Accept build arguments for resource limits
+ARG CPU_QUOTA
+ARG MEMORY_LIMIT
+
 # Set environment variables
 ENV MONGODB_HOST=localhost \
     MONGODB_PORT=27017 \
@@ -33,7 +37,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application code
 COPY google_rss_news.py .
-COPY googlenewsdecoder.py .
 
 # Create non-root user
 RUN useradd -m -r scraper && \
@@ -41,10 +44,6 @@ RUN useradd -m -r scraper && \
 
 # Switch to non-root user
 USER scraper
-
-# Set resource limitations and restart policy
-LABEL com.docker.container.cpu_quota="100000"  # 10% of CPU
-LABEL com.docker.container.memory="256M"       # 256MB memory limit
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \

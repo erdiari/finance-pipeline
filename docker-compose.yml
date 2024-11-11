@@ -1,0 +1,184 @@
+# Common configuration options
+x-logging: &default-logging
+  options:
+    max-size: "10m"
+    max-file: "3"
+  driver: json-file
+
+x-healthcheck: &default-healthcheck
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 5s
+
+x-resources: &default-resources
+  deploy:
+    resources:
+      limits:
+        cpus: '0.1'
+        memory: 256M
+      reservations:
+        cpus: '0.05'
+        memory: 128M
+
+services:
+  # Database Services
+  postgres:
+    image: timescale/timescaledb:latest-pg15
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-timeseries_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - database-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      <<: *default-healthcheck
+    logging: *default-logging
+
+  mongodb:
+    image: mongo:latest
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGODB_USER:-mongo}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGODB_PASSWORD:-mongo}
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - ./databases/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    networks:
+      - database-network
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      <<: *default-healthcheck
+    logging: *default-logging
+
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - database-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      <<: *default-healthcheck
+    logging: *default-logging
+
+  # Data Ingestion Services
+  binance:
+    build:
+      context: ./data_ingest/binance
+      dockerfile: dockerfile
+      args:
+        CPU_QUOTA: "100000"
+        MEMORY_LIMIT: "256M"
+    container_name: binance-service
+    restart: unless-stopped
+    networks:
+      - database-network
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-timeseries_db}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - TRADING_SYMBOLS=${TRADING_SYMBOLS:-BTCUSDT,ETHUSDT,BNBUSDT}
+      - ARCHIVE_INTERVAL_SECONDS=${ARCHIVE_INTERVAL_SECONDS:-60}
+      - BINANCE_WS_URL=${BINANCE_WS_URL:-wss://stream.binance.com:9443/ws}
+    <<: *default-resources
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    logging: *default-logging
+
+  rss:
+    build:
+      context: ./data_ingest/rss
+      dockerfile: dockerfile
+      args:
+        CPU_QUOTA: "100000"
+        MEMORY_LIMIT: "256M"
+    container_name: rss-service
+    restart: unless-stopped
+    networks:
+      - database-network
+    environment:
+      - MONGODB_HOST=mongodb
+      - MONGODB_PORT=27017
+      - MONGODB_USERNAME=${MONGODB_USER:-mongo}
+      - MONGODB_PASSWORD=${MONGODB_PASSWORD:-mongo}
+      - MONGODB_DATABASE=${MONGODB_DATABASE:-news_data}
+      - MONGODB_AUTH_SOURCE=admin
+      - POLL_INTERVAL=${RSS_POLL_INTERVAL:-300}
+      - BATCH_SIZE=${RSS_BATCH_SIZE:-3}
+      - CLEANUP_INTERVAL=${RSS_CLEANUP_INTERVAL:-86400}
+      - RETENTION_DAYS=${RSS_RETENTION_DAYS:-30}
+      - MAINTAIN=${RSS_MAINTAIN:-false}
+    <<: *default-resources
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    healthcheck:
+      test: ps aux | grep python | grep google_rss_news.py || exit 1
+      <<: *default-healthcheck
+    logging: *default-logging
+
+  yahoo:
+    build:
+      context: ./data_ingest/yahoo
+      dockerfile: dockerfile
+      args:
+        CPU_QUOTA: "100000"
+        MEMORY_LIMIT: "256M"
+    container_name: yahoo-service
+    restart: unless-stopped
+    networks:
+      - database-network
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-timeseries_db}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POLL_INTERVAL=${YAHOO_POLL_INTERVAL:-60}
+      - ARCHIVE_INTERVAL=${YAHOO_ARCHIVE_INTERVAL:-300}
+      - LOG_LEVEL=${YAHOO_LOG_LEVEL:-INFO}
+      - SYMBOLS=${YAHOO_SYMBOLS:-AAPL,MSFT,GOOGL,AMZN,META,NVDA,TSLA,JPM,V,NFLX}
+      - BACKOFF_INITIAL_DELAY=${YAHOO_BACKOFF_INITIAL_DELAY:-1.0}
+      - BACKOFF_MAX_DELAY=${YAHOO_BACKOFF_MAX_DELAY:-60.0}
+      - BACKOFF_FACTOR=${YAHOO_BACKOFF_FACTOR:-2.0}
+      - BACKOFF_JITTER=${YAHOO_BACKOFF_JITTER:-0.1}
+      - BACKOFF_MAX_ATTEMPTS=${YAHOO_BACKOFF_MAX_ATTEMPTS:-5}
+    <<: *default-resources
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: python3 -c "import redis; redis.Redis(host='$$REDIS_HOST', port=$$REDIS_PORT).ping()"
+      <<: *default-healthcheck
+    logging: *default-logging
+
+networks:
+  database-network:
+    driver: bridge
+    internal: true
+
+volumes:
+  postgres_data:
+  mongodb_data:
+  redis_data:
